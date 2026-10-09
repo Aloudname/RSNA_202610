@@ -1,0 +1,11 @@
+[project]
+name = "rsna-202610"
+version = "0.1.0"
+description = "A basic RSNA pattern recognition project."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "kagglesdk>=0.1.37",
+    "python-dotenv>=1.2.4",
+    "requests>=2.34.2",
+]

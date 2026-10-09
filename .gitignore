@@ -1,0 +1,11 @@
+# raw data
+raw/
+
+# env
+.env
+
+# private docs
+docs/private/
+
+# agent dir
+.claude/
