@@ -6,3 +6,20 @@ docs/private/
 
 # agent dir
 .claude/
+
+# python caches
+__pycache__/
+*.py[cod]
+
+# virtualenvs (download.sh falls back to a venv inside the repo when uv is absent)
+.venv/
+venv/
+
+# tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# download logs / run locks (default location is RAW_DIR; this is a safety net)
+*.log
+.download.lock

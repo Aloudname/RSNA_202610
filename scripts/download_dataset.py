@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import struct
 import sys
 import threading
@@ -48,6 +49,27 @@ HEADERS = {"User-Agent": "rsna-202610-downloader/1.0"}
 READ_TIMEOUT = (20, 180)  # (connect, read) seconds
 LOCAL_HEADER = 30  # fixed part of a zip local file header
 
+_URL_RE = re.compile(r"https?://[^\s'\"<>)\]]+")
+_QPARAM_RE = re.compile(r"(?i)\b(X-Goog-[A-Za-z]+|X-Amz-[A-Za-z]+|Signature|AWSAccessKeyId"
+                        r"|GoogleAccessId|Expires)=[^&\s'\"]*")
+
+
+def _redact(text: str) -> str:
+    """Strip signed-URL credentials out of text that is about to be printed.
+
+    `requests` exception messages embed the full request URL, and ours carry the
+    signed GCS URL (X-Goog-Signature=...) in the query string, so an unredacted
+    retry line would leak a working URL into any log a user shares.
+    Keeps scheme://host/path for diagnosis, drops the query.
+    """
+    def _strip_query(match: re.Match[str]) -> str:
+        url = match.group(0)
+        return url.split("?", 1)[0] + "?<redacted>" if "?" in url else url
+
+    text = _URL_RE.sub(_strip_query, text)
+    return _QPARAM_RE.sub(r"\1=<redacted>", text)
+
+
 # auth + bundle location
 def get_token() -> str:
     """Access token from the credentials `kaggle auth login` cached (auto-refreshed)."""
@@ -57,7 +79,22 @@ def get_token() -> str:
     creds = KaggleCredentials.load(KaggleClient())
     if creds is None:
         sys.exit("No cached Kaggle credentials. Run `kaggle auth login` first.")
-    token = creds.get_access_token()
+    try:
+        # kagglesdk keeps handing back the cached access token for up to 30
+        # minutes past its expiry (its `access_token_has_expired` carries that
+        # grace period) and the API answers such a token with 401, so ask the
+        # server whether the cached token is still active instead of trusting the
+        # timestamp. Only refresh when it has really lapsed, so that a second run
+        # does not churn tokens the first one is still using.
+        try:
+            creds.introspect()
+        except requests.RequestException:
+            creds.refresh_access_token()
+        token = creds.get_access_token()
+    except requests.RequestException as exc:  # stale/revoked tokens and network errors
+        sys.exit(_redact(f"Could not refresh the Kaggle access token "
+                         f"({type(exc).__name__}: {exc}); "
+                         f"run `kaggle auth login --force` and retry."))
     if not token:
         sys.exit("Could not obtain an access token. Run `kaggle auth login` first.")
     return token
@@ -71,6 +108,7 @@ class BundleLocator:
         self._url: str | None = None
         self._lock = threading.Lock()
         self._token = get_token()
+        self.last_status: int | None = None
         self.resigns = 0
 
     def url(self, refresh: bool = False) -> str:
@@ -83,7 +121,8 @@ class BundleLocator:
                 url = self._request_url()
             if url is None:
                 sys.exit(
-                    f"Could not resolve the bundle. Are you joined to the competition? "
+                    f"Could not resolve the bundle (HTTP {self.last_status}). "
+                    f"Are you joined to the competition? "
                     f"(accept the rules at https://www.kaggle.com/competitions/"
                     f"{self._competition}/rules)"
                 )
@@ -99,6 +138,7 @@ class BundleLocator:
             allow_redirects=False,
             timeout=300,
         )
+        self.last_status = response.status_code
         if response.status_code == 302 and "Location" in response.headers:
             return response.headers["Location"]
         if response.status_code not in (401, 403, 429):
@@ -107,8 +147,12 @@ class BundleLocator:
         return None
 
     def size(self) -> int:
-        response = requests.head(self.url(), headers=HEADERS, timeout=60)
-        response.raise_for_status()
+        try:
+            response = requests.head(self.url(), headers=HEADERS, timeout=60)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            sys.exit(_redact(f"Could not read the bundle size: "
+                             f"{type(exc).__name__}: {exc}"))
         return int(response.headers["Content-Length"])
 
 
@@ -284,7 +328,7 @@ class ParallelHTTPFile(io.RawIOBase):
                 needs_resign = True
                 reason = "signed URL rejected"
             except requests.RequestException as exc:
-                reason = f"{type(exc).__name__}: {exc}"
+                reason = _redact(f"{type(exc).__name__}: {exc}")
             with self._lock:
                 self.retries += 1
             self._drop_session()  # a connection that just failed must not be reused
@@ -387,8 +431,8 @@ def open_index(remote: ParallelHTTPFile) -> tuple[zipfile.ZipFile, list[zipfile.
 
 
 def extract_parallel(dest_root: str, infos: list[zipfile.ZipInfo], remote: ParallelHTTPFile,
-                     locator: BundleLocator, *, write_workers: int,
-                     outstanding: int) -> tuple[int, int | Reporter]:
+                     locator: BundleLocator, *, write_workers: int, outstanding: int,
+                     reporter_state: dict[str, Reporter | None]) -> tuple[int, int | Reporter]:
     """Reader walks the archive in offset order; a pool inflates and stores entries.
 
     Returns (entries skipped as already present, bytes written)."""
@@ -407,6 +451,7 @@ def extract_parallel(dest_root: str, infos: list[zipfile.ZipInfo], remote: Paral
 
     reporter = Reporter(len(infos), sum(info.file_size for info, _ in todo),
                         remote, locator, skipped)
+    reporter_state["reporter"] = reporter  # visible to the caller's Ctrl+C handler
     failures: list[BaseException] = []
 
     def store(info: zipfile.ZipInfo, raw: bytes, dest: str) -> None:
@@ -485,6 +530,27 @@ def extract(dest_root: str, *, limit: int | None, net_workers: int, block_mb: in
         cache_blocks=max(8, cache_mb // block_mb),
         blocks_per_session=session_blocks,
     )
+    # extract_parallel publishes its Reporter here as soon as it exists, so an
+    # interrupt can report how much of this run was already written.
+    reporter_state: dict[str, Reporter | None] = {"reporter": None}
+    try:
+        return _extract_with(remote, locator, dest_root, limit=limit,
+                             write_workers=write_workers, verify_only=verify_only,
+                             dry_run=dry_run, reporter_state=reporter_state)
+    except KeyboardInterrupt:
+        rep = reporter_state["reporter"]
+        done = rep.entries_written if rep is not None else 0
+        print(f"\n[interrupted] after {done:,} entries written this run. Re-run the same "
+              f"command to resume: entries already on disk at the expected size are skipped.",
+              flush=True)
+        return 130
+    finally:
+        remote.close()  # idempotent; safe on success, failure and interrupt alike
+
+
+def _extract_with(remote: ParallelHTTPFile, locator: BundleLocator, dest_root: str, *,
+                  limit: int | None, write_workers: int, verify_only: bool, dry_run: bool,
+                  reporter_state: dict[str, Reporter | None]) -> int:
     started = time.time()
     _zf, infos = open_index(remote)
     if limit:
@@ -495,17 +561,16 @@ def extract(dest_root: str, *, limit: int | None, net_workers: int, block_mb: in
         missing = verify_all(dest_root, infos)
         print(f"[verify] {len(infos):,} entries checked, {missing:,} missing/mismatched",
               flush=True)
-        remote.close()
         return 1 if missing else 0
     if dry_run:
         print(f"[dry-run] would extract {len(infos):,} entries, {human(total_bytes)}; "
               f"nothing written", flush=True)
-        remote.close()
         return 0
 
     skipped, reporter = extract_parallel(dest_root, infos, remote, locator,
                                          write_workers=write_workers,
-                                         outstanding=max(16, write_workers * 6))
+                                         outstanding=max(16, write_workers * 6),
+                                         reporter_state=reporter_state)
     elapsed = time.time() - started
     if isinstance(reporter, Reporter):
         print(f"\n[done] {reporter.entries_written:,} extracted, {skipped:,} already present, "
@@ -555,4 +620,16 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        _code = main()
+    except KeyboardInterrupt:
+        print("\n[interrupted] re-run the same command to resume "
+              "(entries already on disk at the expected size are skipped)",
+              file=sys.stderr, flush=True)
+        # Skip the interpreter's join of the non-daemon fetch threads: close()
+        # can only cancel *queued* fetches, and up to net_workers in-flight ones
+        # would otherwise hold the process for up to READ_TIMEOUT (180 s).
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(130)
+    sys.exit(_code)

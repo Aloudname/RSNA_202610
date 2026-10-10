@@ -1,0 +1,26 @@
+# Normalize line endings on commit; check out native for anything not pinned below.
+* text=auto
+
+# Shell / Python / docs / config stay LF everywhere: the shebang scripts must
+# keep working on Linux, macOS, WSL and Git-Bash.
+*.sh            text eol=lf
+*.py            text eol=lf
+*.md            text eol=lf
+*.toml          text eol=lf
+uv.lock         text eol=lf
+.python-version text eol=lf
+.env.example    text eol=lf
+
+# Windows batch files want CRLF: cmd.exe can mis-parse labels and `goto`
+# in files that are pure LF.
+*.bat           text eol=crlf
+
+# Never touch binary payloads.
+*.zip           binary
+*.gz            binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.npy           binary
+*.pt            binary
+*.pth           binary

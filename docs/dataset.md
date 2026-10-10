@@ -2,7 +2,14 @@
 
 本数据集包含膝关节 MRI 检查，并标注了十二种常见病变：韧带和半月板损伤、骨关节炎的三个腔室、关节积液、滑膜炎、贝克囊肿、骨挫伤和骨折。每项检查均包含来自单次扫描的多个 MRI 序列，格式为 DICOM 序列。任务是预测每项检查中出现这十二种病变的概率。这些研究来自世界各地不同的影像中心，涵盖了各种扫描仪、检查方案和人群。只有一小部分训练研究带有针对特定病症的标签。此外，还提供放射学报告的原始文本，可以从中获取其余研究的标签。
 
-数据集链接等环境变量需仿 `.env.example` 配置，且被 `.gitignore` 限制在本地。需注意，刚 clone 本仓库时，仓库中没有数据集文件，相关文件需通过 [Kaggle CLI](`docs/background/kaggle_cli.md`) 下载至 `.env` 规定的 `RAW_DIR` 中。
+数据集链接等环境变量需仿 `.env.example` 配置，且被 `.gitignore` 限制在本地。需注意，刚 clone 本仓库时，仓库中没有数据集文件；在仓库根目录执行一条命令即可把全量数据拉到 `.env` 规定的 `RAW_DIR`：
+
+```bash
+./download.sh --dest /data/rsna     # Linux / macOS / WSL / Git-Bash
+download.bat --dest D:/rsna         # Windows
+```
+
+该入口会顺带准备依赖、引导 [Kaggle CLI](background/kaggle_cli.md) 的 OAuth 登录并检查磁盘空间，支持中断后重跑同一命令续传；细节见 [docs/background/download.md](background/download.md)。
 
 ## 文件
 
